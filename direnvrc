@@ -252,6 +252,40 @@ _nix_direnv_warn_manual_reload() {
   fi
 }
 
+: "${_nix_direnv_cache_flake_inputs_in_bg:=0}"
+nix_direnv_cache_flake_inputs_in_bg() {
+  _nix_direnv_cache_flake_inputs_in_bg=1
+}
+
+_nix_cache_flake_inputs() {
+  local flake_uri="$1"
+  local flake_inputs="$2"
+  local flake_inputs_old="$3"
+  local populator_pid_file="$4"
+
+  # also add garbage collection root for source
+  mkdir -p "$flake_inputs"
+  flake_input_paths=$(_nix flake archive \
+    --json --no-write-lock-file \
+    -- "$flake_uri")
+
+  while [[ "$flake_input_paths" =~ /nix/store/[^\"]+ ]]; do
+    local store_path="${BASH_REMATCH[0]}"
+    local gcroot="${flake_inputs%%/}/${store_path##*/}"
+    local gcroot_old="${flake_inputs_old%%/}/${store_path##*/}"
+
+    if [[ "$(readlink -n "$gcroot_old")" = "$store_path" ]]; then
+      mv "$gcroot_old" "$gcroot"
+    else
+      _nix_add_gcroot "$store_path" "$gcroot"
+    fi
+
+    flake_input_paths="${flake_input_paths/${store_path}/}"
+  done
+
+  rm -rf "$flake_inputs_old" "$populator_pid_file"
+}
+
 use_flake() {
   if ! _nix_direnv_preflight; then
     return 1
@@ -313,7 +347,15 @@ use_flake() {
         # If we've gotten here, the user's current devShell is valid and we should cache it
 
         # Clean old garbage collection roots except the ones for flake inputs
-        mv "$flake_inputs" "$flake_inputs_old"
+        if [[ ! -e "$flake_inputs_old" ]]; then
+          mv "$flake_inputs" "$flake_inputs_old"
+        else
+          # If $flake_inputs_old already exists,
+          # it is because a previous populator is still running.
+          # Let's start from its old cache
+          # instead of its new but not yet fully populated cache.
+          :
+        fi
         _nix_clean_old_gcroots "$layout_dir"
 
         # We need to update our cache
@@ -321,28 +363,39 @@ use_flake() {
         _nix_add_gcroot "$tmp_profile" "$profile"
         rm -f "$tmp_profile" "$tmp_profile"*
 
-        # also add garbage collection root for source
-        local flake_input_paths
-        mkdir -p "$flake_inputs"
-        flake_input_paths=$(_nix flake archive \
-          --json --no-write-lock-file \
-          -- "$flake_uri")
+        local populator_pid_file="${flake_inputs%%/}.pid"
+        if [[ -e "$populator_pid_file" ]]; then
+          local populator_pid=$(< "$populator_pid_file")
 
-        while [[ $flake_input_paths =~ /nix/store/[^\"]+ ]]; do
-          local store_path="${BASH_REMATCH[0]}"
-          local gcroot="${flake_inputs%%/}/${store_path##*/}"
-          local gcroot_old="${flake_inputs_old%%/}/${store_path##*/}"
+          # Kill the old populator; don't fail if it exited already
+          kill -TERM "$populator_pid" || :
 
-          if [[ "$(readlink -n "$gcroot_old")" = "$store_path" ]]; then
-            mv "$gcroot_old" "$gcroot"
-          else
-            _nix_add_gcroot "$store_path" "$gcroot"
-          fi
+          # Wait for the old populator to exit
+          tail --pid "$populator_pid" --follow /dev/null || :
 
-          flake_input_paths="${flake_input_paths/${store_path}/}"
-        done
+          rm -f "$populator_pid_file"
+        fi
 
-        rm -rf "$flake_inputs_old"
+        if [[ $_nix_direnv_cache_flake_inputs_in_bg -eq 1 ]]; then
+          _nix_direnv_info "Caching flake inputs in the background..."
+
+          # Spawn the populator
+          # Note we need to close file descriptor 3 so that the shell does not hang.
+          # https://github.com/direnv/direnv/issues/755#issuecomment-800129928
+          _nix_cache_flake_inputs \
+            "$flake_uri" \
+            "$flake_inputs" \
+            "$flake_inputs_old" \
+            "$populator_pid_file" \
+            <&- >&- 2>&- 3>&- &
+          echo -n "$!" > "$populator_pid_file"
+        else
+          _nix_cache_flake_inputs \
+            "$flake_uri" \
+            "$flake_inputs" \
+            "$flake_inputs_old" \
+            "$populator_pid_file"
+        fi
 
         _nix_direnv_info "Renewed cache"
       else
