@@ -286,6 +286,7 @@ use_flake() {
   profile="${layout_dir}/flake-profile$(_nix_argsum_suffix "$flake_expr")"
   local profile_rc="${profile}.rc"
   local flake_inputs="${layout_dir}/flake-inputs/"
+  local flake_inputs_old="${flake_inputs%%/}-old/"
 
   local need_update=0
   local watches
@@ -310,6 +311,9 @@ use_flake() {
       local tmp_profile="${layout_dir}/flake-tmp-profile.$$"
       if tmp_profile_rc=$(_nix print-dev-env --profile "$tmp_profile" "$@"); then
         # If we've gotten here, the user's current devShell is valid and we should cache it
+
+        # Clean old garbage collection roots except the ones for flake inputs
+        mv "$flake_inputs" "$flake_inputs_old"
         _nix_clean_old_gcroots "$layout_dir"
 
         # We need to update our cache
@@ -326,9 +330,19 @@ use_flake() {
 
         while [[ $flake_input_paths =~ /nix/store/[^\"]+ ]]; do
           local store_path="${BASH_REMATCH[0]}"
-          _nix_add_gcroot "${store_path}" "${flake_inputs}/${store_path##*/}"
+          local gcroot="${flake_inputs%%/}/${store_path##*/}"
+          local gcroot_old="${flake_inputs_old%%/}/${store_path##*/}"
+
+          if [[ "$(readlink -n "$gcroot_old")" = "$store_path" ]]; then
+            mv "$gcroot_old" "$gcroot"
+          else
+            _nix_add_gcroot "$store_path" "$gcroot"
+          fi
+
           flake_input_paths="${flake_input_paths/${store_path}/}"
         done
+
+        rm -rf "$flake_inputs_old"
 
         _nix_direnv_info "Renewed cache"
       else
